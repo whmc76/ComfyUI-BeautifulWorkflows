@@ -39,7 +39,8 @@ def process_workflow(
 
     # Step 2: comprehensive LLM analysis - ONE call for all decisions
     print("  -> Calling LLM for comprehensive analysis...")
-    analysis = analyze_workflow(workflow, user_info_text, model=model)
+    source_filename = os.path.splitext(os.path.basename(input_path))[0]
+    analysis = analyze_workflow(workflow, user_info_text, model=model, source_filename=source_filename)
 
     # Step 3: apply cleaning decisions from analysis
     print("  -> Applying ad removal and note cleaning...")

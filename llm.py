@@ -4,12 +4,13 @@ import json
 import re
 import urllib.request
 import urllib.error
+import config as _cfg
 from config import OLLAMA_BASE_URL, OLLAMA_MODELS, OLLAMA_TIMEOUT, NODE_CATEGORIES
 from search import search_workflow_context
 
 
 # ---------------------------------------------------------------------------
-# Raw API
+# Raw API — Ollama
 # ---------------------------------------------------------------------------
 
 def _ollama_generate(model: str, prompt: str) -> str | None:
@@ -34,6 +35,54 @@ def _ollama_generate(model: str, prompt: str) -> str | None:
     except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
         print(f"  [llm] Ollama request failed ({model}): {exc}")
         return None
+
+
+# ---------------------------------------------------------------------------
+# Raw API — OpenAI-compatible cloud (MiniMax / Kimi)
+# ---------------------------------------------------------------------------
+
+def _api_generate(provider_name: str, model: str, api_key: str, prompt: str) -> str | None:
+    """
+    Call an OpenAI-compatible /chat/completions endpoint with optional built-in
+    search tool support (MiniMax web_search / Kimi $web_search).
+    Handles multi-turn tool-call loops so the model can search before answering.
+    """
+    provider = _cfg.API_PROVIDERS.get(provider_name, {})
+    base_url = provider.get("base_url", "")
+    search_tool = provider.get("search_tool")
+
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.1,
+    }
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        f"{base_url}/chat/completions",
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            result = json.loads(resp.read().decode())
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+        print(f"  [llm] API request failed ({provider_name}/{model}): {exc}")
+        return None
+
+    if "error" in result:
+        print(f"  [llm] API error ({provider_name}): {result['error']}")
+        return None
+
+    choices = result.get("choices", [])
+    if not choices:
+        print(f"  [llm] Empty choices from {provider_name}")
+        return None
+
+    return choices[0].get("message", {}).get("content", "").strip() or None
 
 
 def _parse_json_response(text: str) -> dict | None:
@@ -83,11 +132,22 @@ def _extract_ad_candidates(workflow: dict) -> dict[str, dict]:
     IMAGE_NODE_TYPES = {"LoadImage", "ImageFromBase64", "ETN_LoadImageBase64", "PreviewImage"}
 
     candidates = {}
+    # These node types use their title as a functional variable name (Set/Get routing).
+    # Clearing their title breaks workflow linkage — never include them as ad candidates.
+    FUNCTIONAL_TITLE_TYPES = {
+        "SetNode", "GetNode", "SetVariable", "GetVariable",
+        "Reroute", "PrimitiveNode", "PrimitiveBoolean",
+    }
+
     for node in workflow.get("nodes", []):
         nid = str(node.get("id"))
         ntype = node.get("type", "")
         title = node.get("title", "")
         text = ""
+
+        # Skip nodes whose title is functionally required
+        if ntype in FUNCTIONAL_TITLE_TYPES:
+            continue
 
         # Note/Markdown nodes: grab widget text
         if ntype == "Note" or "note" in ntype.lower() or "markdown" in ntype.lower():
@@ -155,13 +215,64 @@ def _extract_tech_identifiers(workflow: dict) -> str:
     return ", ".join(found) if found else ""
 
 
-def _build_analysis_prompt(workflow: dict, user_info_text: str, web_context: str = "") -> str:
+def _node_signals(node: dict) -> list[tuple[str, str]]:
     """
-    Minimal prompt: LLM sees id+type list, ad candidates, web search context,
+    Extract observable signals from a node to help LLM classify it correctly.
+    Returns list of (tag, detail) tuples, e.g.:
+      ("prompt_text", "A woman exits an elevator...")
+      ("file_upload", "photo.png")
+      ("toggle", "")
+    """
+    widgets = node.get("widgets_values", [])
+    if isinstance(widgets, dict):
+        widgets = list(widgets.values())
+
+    signals = []
+    seen_tags = set()
+
+    for w in widgets:
+        match w:
+            case str() if len(w) > 80:
+                # Long string = user-written creative content (prompt, description)
+                # Short strings are model names/paths set by the workflow author
+                if "prompt_text" not in seen_tags:
+                    seen_tags.add("prompt_text")
+                    # Include first 100 chars so LLM can read the actual content
+                    signals.append(("prompt_text", w[:100].replace("\n", " ")))
+            case str() if any(w.lower().endswith(ext) for ext in
+                              (".png", ".jpg", ".jpeg", ".webp",
+                               ".mp4", ".webm", ".avi", ".mov",
+                               ".wav", ".mp3", ".flac", ".ogg")):
+                if "file_upload" not in seen_tags:
+                    seen_tags.add("file_upload")
+                    signals.append(("file_upload", w))
+            case bool():
+                if "toggle" not in seen_tags:
+                    seen_tags.add("toggle")
+                    signals.append(("toggle", ""))
+    return signals
+
+
+def _build_analysis_prompt(workflow: dict, user_info_text: str, web_context: str = "", source_filename: str = "") -> str:
+    """
+    Minimal prompt: LLM sees id+type+signals list, ad candidates, web search context,
     and user info. Widget values and links stay in Python - LLM owns strategy only.
     """
     nodes = workflow.get("nodes", [])
-    node_list = "\n".join(f"  {n.get('id')}: {n.get('type', 'unknown')}" for n in nodes)
+
+    # Build node list with observable signals to help LLM classify correctly
+    node_lines = []
+    for n in nodes:
+        signals = _node_signals(n)
+        if signals:
+            sig_parts = []
+            for tag, detail in signals:
+                sig_parts.append(f"{tag}: {detail!r}" if detail else tag)
+            sig_str = " [" + " | ".join(sig_parts) + "]"
+        else:
+            sig_str = ""
+        node_lines.append(f"  {n.get('id')}: {n.get('type', 'unknown')}{sig_str}")
+    node_list = "\n".join(node_lines)
     node_ids = [str(n.get("id")) for n in nodes]
 
     tech_ids = _extract_tech_identifiers(workflow)
@@ -182,11 +293,13 @@ def _build_analysis_prompt(workflow: dict, user_info_text: str, web_context: str
 
     web_section = f"\n{web_context}\n" if web_context else ""
 
+    source_section = f"\n## SOURCE FILENAME (use this as primary naming hint — translate or summarize if non-English)\n{source_filename}\n" if source_filename else ""
+
     return f"""You are a ComfyUI workflow analyst. Return ONLY a JSON object with your strategy decisions.
 
 ## USER INFO
 {user_info_text or "(none)"}
-
+{source_section}
 ## NODE LIST (id: type)
 {node_list}
 {tech_section}{ad_section}{web_section}
@@ -203,7 +316,13 @@ def _build_analysis_prompt(workflow: dict, user_info_text: str, web_context: str
 
 ## CATEGORY RULES (assign ALL ids: {', '.join(node_ids)})
 Priority: Input and Output override all other categories.
-- **Input**: nodes the USER directly interacts with to start the workflow — image/video upload nodes (LoadImage, VHS_LoadVideo), prompt text nodes (CLIPTextEncode where user writes prompts), seed/config primitive nodes the user typically tweaks. These become the leftmost "Input Console" column.
+- **Input**: ALL nodes the user directly touches to run or configure the workflow. Use the signal tags to identify them — type names alone are NOT sufficient:
+  • [prompt_text] signal → node has a long text widget (>80 chars) = user writes prompts/descriptions here. Classify as Input regardless of node type name.
+  • [file_upload] signal → node widget contains a media file path (image/video/audio). User uploads their own file. Classify as Input.
+  • [toggle] signal → boolean switch. If it's a top-level mode selector (not buried inside a complex node), classify as Input.
+  • Any node whose type name clearly implies user media upload (Load*, *Upload*, *Input*).
+  Do NOT classify Loader nodes (model/checkpoint/VAE loaders) as Input — those load model weights, not user content.
+  These become the leftmost "Input Console" column.
 - **Output**: nodes that produce final results — SaveImage, SaveVideo, PreviewImage, VHS_VideoCombine, any node that writes files or shows results. These become the rightmost "Output Console" column.
 - Loader: model/checkpoint/VAE/LoRA/CLIP/UNET loaders (NOT image upload)
 - Conditioning: conditioning, guidance, style, flux guidance
@@ -217,6 +336,7 @@ Priority: Input and Output override all other categories.
 - ad_node_ids: purely promotional nodes (discord, patreon, social shilling). Remove entirely.
 - cleaned_notes: mixed content notes - return text with ad lines stripped.
 - cleaned_titles: ad-only titles - return "" to clear.
+- NEVER touch SetNode/GetNode/Reroute/PrimitiveNode titles — they are functional variable names that link nodes together. Clearing them breaks the workflow.
 
 Return valid JSON only. No markdown fences. No trailing commas.
 """
@@ -229,34 +349,63 @@ Return valid JSON only. No markdown fences. No trailing commas.
 MAX_RETRIES = 3
 
 
-def analyze_workflow(workflow: dict, user_info_text: str, model: str | None = None) -> dict:
+def analyze_workflow(workflow: dict, user_info_text: str, model: str | None = None, source_filename: str = "") -> dict:
     """
-    Web search -> LLM analysis with retry. Raises RuntimeError if all attempts fail.
-    No heuristic fallback - quality matters more than always succeeding.
+    Route to cloud API or local Ollama based on ACTIVE_PROVIDER.
+    Cloud providers use their built-in search; Ollama falls back to SearXNG.
+    Raises RuntimeError if all attempts fail.
     """
-    print("  [search] Fetching web context for workflow nodes...")
-    web_context = search_workflow_context(workflow)
-    if web_context:
-        print(f"  [search] Got {web_context.count(chr(10))} lines of context")
+    provider = _cfg.ACTIVE_PROVIDER
+
+    if provider in _cfg.API_PROVIDERS:
+        # ── Cloud API path (MiniMax / Kimi) ───────────────────────────────────
+        api_key = _cfg.ACTIVE_API_KEY
+        if not api_key:
+            raise RuntimeError(f"No API key configured for provider '{provider}'")
+        m = model or _cfg.ACTIVE_API_MODEL or _cfg.API_PROVIDERS[provider]["default_model"]
+        # Cloud providers have built-in search — no SearXNG needed
+        prompt = _build_analysis_prompt(workflow, user_info_text, web_context="", source_filename=source_filename)
+        print(f"  [llm] Using cloud provider: {provider} / {m}")
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            print(f"  [llm] Calling {provider}/{m} (attempt {attempt}/{MAX_RETRIES})...")
+            raw = _api_generate(provider, m, api_key, prompt)
+            if not raw:
+                print(f"  [llm] No response, retrying...")
+                continue
+            result = _parse_json_response(raw)
+            if result and _validate_analysis(result, workflow):
+                _log_analysis(result)
+                return result
+            print(f"  [llm] Response failed validation, retrying...")
+
+        raise RuntimeError(f"Cloud API analysis failed after {MAX_RETRIES} attempts ({provider}/{m})")
+
     else:
-        print("  [search] No web context (offline or no results)")
+        # ── Ollama local path ─────────────────────────────────────────────────
+        print("  [search] Fetching web context for workflow nodes...")
+        web_context = search_workflow_context(workflow)
+        if web_context:
+            print(f"  [search] Got {web_context.count(chr(10))} lines of context")
+        else:
+            print("  [search] No web context (offline or no results)")
 
-    prompt = _build_analysis_prompt(workflow, user_info_text, web_context)
-    m = model or OLLAMA_MODELS[0]
+        prompt = _build_analysis_prompt(workflow, user_info_text, web_context, source_filename=source_filename)
+        m = model or OLLAMA_MODELS[0]
 
-    for attempt in range(1, MAX_RETRIES + 1):
-        print(f"  [llm] Calling {m} (attempt {attempt}/{MAX_RETRIES})...")
-        raw = _ollama_generate(m, prompt)
-        if not raw:
-            print(f"  [llm] No response from {m}, retrying...")
-            continue
-        result = _parse_json_response(raw)
-        if result and _validate_analysis(result, workflow):
-            _log_analysis(result)
-            return result
-        print(f"  [llm] Response failed validation, retrying...")
+        for attempt in range(1, MAX_RETRIES + 1):
+            print(f"  [llm] Calling {m} (attempt {attempt}/{MAX_RETRIES})...")
+            raw = _ollama_generate(m, prompt)
+            if not raw:
+                print(f"  [llm] No response from {m}, retrying...")
+                continue
+            result = _parse_json_response(raw)
+            if result and _validate_analysis(result, workflow):
+                _log_analysis(result)
+                return result
+            print(f"  [llm] Response failed validation, retrying...")
 
-    raise RuntimeError(f"LLM analysis failed after {MAX_RETRIES} attempts with model {m}")
+        raise RuntimeError(f"LLM analysis failed after {MAX_RETRIES} attempts with model {m}")
 
 
 def _validate_analysis(result: dict, workflow: dict) -> bool:

@@ -48,9 +48,14 @@ FG_YELLOW= "#f9e2af"
 
 def _load_config() -> dict:
     defaults = {
-        "ollama_url":  "http://localhost:11434",
-        "ollama_model": "qwen3.5:9b",
+        "ollama_url":    "http://localhost:11434",
+        "ollama_model":  "qwen3.5:9b",
         "searxng_container": "searxng",
+        "provider":      "ollama",   # "ollama" | "minimax" | "kimi"
+        "minimax_key":   "",
+        "minimax_model": "MiniMax-M2.5",
+        "kimi_key":      "",
+        "kimi_model":    "kimi-k2-5-instruct",
     }
     if os.path.exists(CONFIG_FILE):
         try:
@@ -226,21 +231,68 @@ class App(TkDnD if HAS_DND else tk.Tk):
                            bd=1, relief="solid", highlightbackground=BORDER)
         sf.pack(fill="x", pady=(0, 10))
 
-        tk.Label(sf, text="Ollama URL", bg=BG, fg=FG_DIM,
-                 font=("Segoe UI", 8)).grid(row=0, column=0, sticky="w", padx=8, pady=(8,2))
-        self._url_var = tk.StringVar(value=self.cfg["ollama_url"])
-        url_entry = ttk.Entry(sf, textvariable=self._url_var)
-        url_entry.grid(row=1, column=0, columnspan=2, sticky="ew", padx=8, pady=(0,6))
-        url_entry.bind("<FocusOut>", lambda _: self._refresh_models())
+        # Provider radio buttons
+        self._provider_var = tk.StringVar(value=self.cfg.get("provider", "ollama"))
+        prow = tk.Frame(sf, bg=BG)
+        prow.grid(row=0, column=0, columnspan=2, sticky="w", padx=8, pady=(8,4))
+        for val, label in [("ollama", "🖥 Ollama"), ("minimax", "☁ MiniMax"), ("kimi", "🌙 Kimi")]:
+            tk.Radiobutton(
+                prow, text=label, variable=self._provider_var, value=val,
+                bg=BG, fg=FG, selectcolor=SURFACE, activebackground=BG,
+                activeforeground=ACCENT, font=("Segoe UI", 9),
+                command=self._on_provider_change,
+            ).pack(side="left", padx=(0, 8))
 
-        tk.Label(sf, text="Model", bg=BG, fg=FG_DIM,
+        # ── Ollama sub-panel ──
+        self._ollama_frame = tk.Frame(sf, bg=BG)
+        self._ollama_frame.grid(row=1, column=0, columnspan=2, sticky="ew")
+        tk.Label(self._ollama_frame, text="Ollama URL", bg=BG, fg=FG_DIM,
+                 font=("Segoe UI", 8)).grid(row=0, column=0, sticky="w", padx=8, pady=(0,2))
+        self._url_var = tk.StringVar(value=self.cfg["ollama_url"])
+        url_entry = ttk.Entry(self._ollama_frame, textvariable=self._url_var)
+        url_entry.grid(row=1, column=0, columnspan=2, sticky="ew", padx=8, pady=(0,4))
+        url_entry.bind("<FocusOut>", lambda _: self._refresh_models())
+        tk.Label(self._ollama_frame, text="Model", bg=BG, fg=FG_DIM,
                  font=("Segoe UI", 8)).grid(row=2, column=0, sticky="w", padx=8)
         self._model_var = tk.StringVar(value=self.cfg["ollama_model"])
-        self._model_cb = ttk.Combobox(sf, textvariable=self._model_var, state="readonly")
+        self._model_cb = ttk.Combobox(self._ollama_frame, textvariable=self._model_var, state="readonly")
         self._model_cb.grid(row=3, column=0, sticky="ew", padx=8, pady=(0,6))
-        ttk.Button(sf, text="↺", width=3,
+        ttk.Button(self._ollama_frame, text="↺", width=3,
                    command=self._refresh_models).grid(row=3, column=1, padx=(0,8))
+        self._ollama_frame.columnconfigure(0, weight=1)
+
+        # ── MiniMax sub-panel ──
+        self._minimax_frame = tk.Frame(sf, bg=BG)
+        self._minimax_frame.grid(row=1, column=0, columnspan=2, sticky="ew")
+        tk.Label(self._minimax_frame, text="MiniMax API Key", bg=BG, fg=FG_DIM,
+                 font=("Segoe UI", 8)).grid(row=0, column=0, sticky="w", padx=8, pady=(0,2))
+        self._minimax_key_var = tk.StringVar(value=self.cfg.get("minimax_key", ""))
+        ttk.Entry(self._minimax_frame, textvariable=self._minimax_key_var, show="•").grid(
+            row=1, column=0, sticky="ew", padx=8, pady=(0,4))
+        tk.Label(self._minimax_frame, text="Model", bg=BG, fg=FG_DIM,
+                 font=("Segoe UI", 8)).grid(row=2, column=0, sticky="w", padx=8)
+        self._minimax_model_var = tk.StringVar(value=self.cfg.get("minimax_model", "MiniMax-M2.5"))
+        ttk.Entry(self._minimax_frame, textvariable=self._minimax_model_var).grid(
+            row=3, column=0, sticky="ew", padx=8, pady=(0,6))
+        self._minimax_frame.columnconfigure(0, weight=1)
+
+        # ── Kimi sub-panel ──
+        self._kimi_frame = tk.Frame(sf, bg=BG)
+        self._kimi_frame.grid(row=1, column=0, columnspan=2, sticky="ew")
+        tk.Label(self._kimi_frame, text="Kimi API Key", bg=BG, fg=FG_DIM,
+                 font=("Segoe UI", 8)).grid(row=0, column=0, sticky="w", padx=8, pady=(0,2))
+        self._kimi_key_var = tk.StringVar(value=self.cfg.get("kimi_key", ""))
+        ttk.Entry(self._kimi_frame, textvariable=self._kimi_key_var, show="•").grid(
+            row=1, column=0, sticky="ew", padx=8, pady=(0,4))
+        tk.Label(self._kimi_frame, text="Model", bg=BG, fg=FG_DIM,
+                 font=("Segoe UI", 8)).grid(row=2, column=0, sticky="w", padx=8)
+        self._kimi_model_var = tk.StringVar(value=self.cfg.get("kimi_model", "kimi-k2-5-instruct"))
+        ttk.Entry(self._kimi_frame, textvariable=self._kimi_model_var).grid(
+            row=3, column=0, sticky="ew", padx=8, pady=(0,6))
+        self._kimi_frame.columnconfigure(0, weight=1)
+
         sf.columnconfigure(0, weight=1)
+        self._on_provider_change()  # show correct sub-panel
 
         # User info file
         uif = tk.LabelFrame(parent, text=" 👤 User Info ", bg=BG, fg=ACCENT,
@@ -328,6 +380,20 @@ class App(TkDnD if HAS_DND else tk.Tk):
         btn_row.pack(fill="x", padx=8, pady=(0,6))
         ttk.Button(btn_row, text="Clear log",
                    command=self._clear_log).pack(side="right")
+
+    # ── Provider switching ─────────────────────────────────────────────────────
+
+    def _on_provider_change(self):
+        p = self._provider_var.get()
+        self._ollama_frame.grid_remove()
+        self._minimax_frame.grid_remove()
+        self._kimi_frame.grid_remove()
+        if p == "ollama":
+            self._ollama_frame.grid()
+        elif p == "minimax":
+            self._minimax_frame.grid()
+        elif p == "kimi":
+            self._kimi_frame.grid()
 
     # ── Services ───────────────────────────────────────────────────────────────
 
@@ -443,14 +509,30 @@ class App(TkDnD if HAS_DND else tk.Tk):
             return
 
         # Save current settings
-        self.cfg["ollama_url"]   = self._url_var.get().strip()
-        self.cfg["ollama_model"] = self._model_var.get().strip()
+        provider = self._provider_var.get()
+        self.cfg["provider"]       = provider
+        self.cfg["ollama_url"]     = self._url_var.get().strip()
+        self.cfg["ollama_model"]   = self._model_var.get().strip()
+        self.cfg["minimax_key"]    = self._minimax_key_var.get().strip()
+        self.cfg["minimax_model"]  = self._minimax_model_var.get().strip()
+        self.cfg["kimi_key"]       = self._kimi_key_var.get().strip()
+        self.cfg["kimi_model"]     = self._kimi_model_var.get().strip()
         _save_config(self.cfg)
 
-        # Patch config.py values at runtime
+        # Patch config module at runtime
         import config as cfg_mod
-        cfg_mod.OLLAMA_BASE_URL = self.cfg["ollama_url"]
-        cfg_mod.OLLAMA_MODELS   = [self.cfg["ollama_model"]]
+        cfg_mod.OLLAMA_BASE_URL  = self.cfg["ollama_url"]
+        cfg_mod.OLLAMA_MODELS    = [self.cfg["ollama_model"]]
+        cfg_mod.ACTIVE_PROVIDER  = provider
+        if provider == "minimax":
+            cfg_mod.ACTIVE_API_KEY   = self.cfg["minimax_key"]
+            cfg_mod.ACTIVE_API_MODEL = self.cfg["minimax_model"]
+        elif provider == "kimi":
+            cfg_mod.ACTIVE_API_KEY   = self.cfg["kimi_key"]
+            cfg_mod.ACTIVE_API_MODEL = self.cfg["kimi_model"]
+        else:
+            cfg_mod.ACTIVE_API_KEY   = ""
+            cfg_mod.ACTIVE_API_MODEL = ""
 
         self._running = True
         self._run_btn.state(["disabled"])
@@ -473,9 +555,12 @@ class App(TkDnD if HAS_DND else tk.Tk):
                 self._log_msg(f"\n{'─'*50}", "dim")
                 self._log_msg(f"Processing: {os.path.basename(path)}", "accent")
                 try:
+                    # For cloud providers, model is set via cfg_mod.ACTIVE_API_MODEL;
+                    # pass None so analyze_workflow picks it up from config.
+                    ollama_model = self.cfg["ollama_model"] if self.cfg["provider"] == "ollama" else None
                     out = bmod.process_workflow(
                         path,
-                        model=self.cfg["ollama_model"],
+                        model=ollama_model,
                         user_info_override=self._user_info_path,
                     )
                     success.append((path, out))

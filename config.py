@@ -7,6 +7,35 @@ OLLAMA_TIMEOUT = 120
 
 SEARXNG_URL = "http://localhost:8888/search"
 
+# --------------------------------------------------------------------------
+# Cloud API providers (OpenAI-compatible)
+# --------------------------------------------------------------------------
+API_PROVIDERS: dict[str, dict] = {
+    "minimax": {
+        "base_url": "https://api.minimax.chat/v1",
+        "default_model": "MiniMax-M2.5",
+        # MiniMax built-in web search tool format
+        "search_tool": {
+            "type": "web_search",
+            "web_search": {"enable": True, "search_mode": "performance_first"},
+        },
+    },
+    "kimi": {
+        "base_url": "https://api.moonshot.cn/v1",
+        "default_model": "kimi-k2-5-instruct",
+        # Kimi built-in search (server-side execution)
+        "search_tool": {
+            "type": "builtin_function",
+            "function": {"name": "$web_search"},
+        },
+    },
+}
+
+# Set by GUI/CLI at runtime; "ollama" means use local Ollama
+ACTIVE_PROVIDER: str = "ollama"   # "ollama" | "minimax" | "kimi"
+ACTIVE_API_KEY: str = ""
+ACTIVE_API_MODEL: str = ""        # overrides provider default_model when set
+
 # Category display config: color and pipeline order for layout/grouping.
 # Category names must match exactly what the LLM is asked to return.
 # Input/Output are special console columns placed at far-left and far-right.
